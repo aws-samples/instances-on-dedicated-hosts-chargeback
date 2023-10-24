@@ -1,0 +1,258 @@
+# Purpose:  Creates Athena Workgroups, Named Queries, IAM Users via AWS CloudFormation
+#===============================================================================
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Dedicated Hosts IT Chargeback solution - Creates S3 Bucket, Athena Workgroups and Athena Named Queries
+
+Parameters:
+  curDatabase:
+    Description: Specify the CUR Database Name
+    Type: String
+
+  curTable:
+    Description: Specify the CUR Table Name
+    Type: String
+
+  costAllocationTag:
+    Description: Specify the Cost Allocation tag to create the aggregations. This is usually a Cost Center, Department or similar.
+    Type: String
+
+Resources:
+  AthenaBucket:
+    Type: "AWS::S3::Bucket"
+    Properties: 
+      BucketName: !Join [ "-", ["dedicated-host-chargeback", Ref: "AWS::AccountId"]]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteContentAfter30Days
+            Status: 'Enabled'
+            ExpirationInDays: 30
+
+  dedicatedHostChargeback:
+    Type: AWS::Athena::WorkGroup
+    Properties:       
+      Name: dedicatedHostChargeback
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Join [ "", ["s3://" , !Ref AthenaBucket, "/"]]
+  
+  dedicatedHostDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      DatabaseInput:
+        Name: "dedicated_host_db"
+      CatalogId: 
+        Ref: AWS::AccountId
+
+  createDedicatedHostsView:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      WorkGroup: !Ref dedicatedHostChargeback
+      Database: !Ref curDatabase
+      Description: "Create view for Dedicated Hosts"
+      Name: "1.CREATE_dedicated_hosts_view"
+      QueryString: !Sub |
+                    CREATE OR REPLACE VIEW "dedicated_host_db"."dedicated_hosts_view" AS
+                    SELECT
+                        line_item_usage_account_id,
+                        product_instance_type_family,
+                        CAST(product_vcpu AS decimal(20, 2)) product_vcpu,
+                        product_region,
+                        year,
+                        month,
+                        "count"(DISTINCT line_item_resource_id) number_of_DH,
+                        CAST(
+                            "count"(identity_time_interval) AS decimal(20, 2)
+                        ) hours_on,
+                        CAST(
+                            "sum"(line_item_unblended_cost) AS decimal(20, 8)
+                        ) "total_unblended_cost",
+                        resource_tags_user_${costAllocationTag} cost_allocation_tag
+                    FROM
+                        "${curDatabase}"."${curTable}"
+                    WHERE
+                        (
+                            (product_tenancy = 'Host')
+                            AND (product_product_family = 'Dedicated Host')
+                            AND (line_item_line_item_type = 'Usage')
+                        )
+                    GROUP BY
+                        line_item_usage_account_id,
+                        year,
+                        month,
+                        product_region,
+                        product_instance_type_family,
+                        resource_tags_user_${costAllocationTag},
+                        product_vcpu
+                    ORDER BY
+                        year ASC,
+                        month DESC
+                    
+  createInstancesOnDedicatedHostsView:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      WorkGroup: !Ref dedicatedHostChargeback
+      Database: !Ref curDatabase
+      Description: "Create view for EC2 instances running on top of Dedicated Hosts"
+      Name: "2.CREATE_instances_on_dedicated_hosts_view"
+      QueryString: !Sub |
+                    CREATE OR REPLACE VIEW "dedicated_host_db"."instances_on_dedicated_hosts_view" AS
+                    SELECT line_item_usage_account_id,
+                        product_instance_type,
+                        product_instance_type_family,
+                        CAST(product_vcpu AS decimal(20, 2)) product_vcpu,
+                        product_region,
+                        line_item_resource_id ec2_resource_id,
+                        CAST(
+                            "count"(identity_time_interval) AS decimal(20, 2)
+                        ) hours_on,
+                        year,
+                        month,
+                        resource_tags_user_${costAllocationTag} cost_allocation_tag
+                    FROM "${curDatabase}"."${curTable}"
+                    WHERE (
+                            (product_tenancy = 'Host')
+                            AND (product_product_family = 'Compute Instance')
+                        )
+                    GROUP BY line_item_usage_account_id,
+                        year,
+                        month,
+                        product_instance_type,
+                        product_region,
+                        resource_tags_user_${costAllocationTag},
+                        product_vcpu,
+                        line_item_resource_id,
+                        product_instance_type_family
+                    ORDER BY year ASC,
+                        month DESC
+
+  createJoinedSplitRatiosView:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      WorkGroup: !Ref dedicatedHostChargeback
+      Database: !Ref curDatabase
+      Description: "Create view for Dedicated Hosts"
+      Name: "3.CREATE_joined_split_ratios_view"
+      QueryString: !Sub |
+                    CREATE OR REPLACE VIEW "dedicated_host_db"."dh_joined_split_ratios_view" AS
+                    SELECT ec2.line_item_usage_account_id,
+                        ec2.cost_allocation_tag,
+                        ec2_resource_id,
+                        ec2.product_instance_type,
+                        ec2.hours_on,
+                        ec2.product_region,
+                        ec2.year,
+                        ec2.month,
+                        CAST(
+                        (
+                          (
+                            (
+                              ((1E0 * ec2.product_vcpu) / dh.product_vcpu) * dh.number_of_DH
+                            ) * ec2.hours_on
+                          ) / dh.hours_on
+                        ) AS decimal(10, 4)
+                      ) split_ratio,
+                        CAST(
+                        (
+                          (
+                            (
+                              (
+                                (
+                                  (1E0 * dh.total_unblended_cost) * ec2.product_vcpu
+                                ) / dh.product_vcpu
+                              ) * dh.number_of_DH
+                            ) * ec2.hours_on
+                          ) / dh.hours_on
+                        ) AS decimal(20, 4)
+                      ) split_cost
+                    FROM (
+                            "dedicated_host_db"."dedicated_hosts_view" dh
+                            INNER JOIN "dedicated_host_db"."instances_on_dedicated_hosts_view" ec2 ON (
+                                (dh.year = ec2.year)
+                                AND (dh.month = ec2.month)
+                                AND (
+                                    dh.product_instance_type_family = ec2.product_instance_type_family
+                                )
+                                AND (dh.product_region = ec2.product_region)
+                            )
+                        )
+
+  accountIdBaseSplit:
+      Type: AWS::Athena::NamedQuery
+      Properties:
+        WorkGroup: !Ref dedicatedHostChargeback
+        Database: !Ref curDatabase
+        Description: "Sample Query returning the Split consumption of EC2 on top of DH grouped by Account ID for a specific month/year"
+        Name: "account_id_base_split"
+        QueryString: !Sub |
+                      SELECT line_item_usage_account_id,
+                        sum(split_ratio) as split_ratio,
+                        sum(split_cost) as split_cost
+                      FROM "dedicated_host_db"."dh_joined_split_ratios_view"
+                      where month = ?
+                        and year = ?
+                      group by line_item_usage_account_id
+                      order by 1
+
+  dedicatedHosts:
+      Type: AWS::Athena::NamedQuery
+      Properties:
+        WorkGroup: !Ref dedicatedHostChargeback
+        Database: !Ref curDatabase
+        Description: "Sample Query returning a detail list of all DH in the organization grouped by Instance Family, Account and Region"
+        Name: "dedicated_hosts"
+        QueryString: !Sub |
+                      SELECT product_instance_type_family,
+                        product_region,
+                        line_item_usage_account_id,
+                        sum(total_unblended_cost) as total_cost,
+                        sum(hours_on) as hours_on,
+                        sum(number_of_DH) as number_of_DH
+                      FROM "dedicated_host_db"."dedicated_hosts_view"
+                      where month = ?
+                        and year = ?
+                      group by product_instance_type_family,
+                        line_item_usage_account_id,
+                        product_region;
+
+  detailEc2List:
+        Type: AWS::Athena::NamedQuery
+        Properties:
+          WorkGroup: !Ref dedicatedHostChargeback
+          Database: !Ref curDatabase
+          Description: "Sample Query returning a detailed list of EC2 instances running on top of DH and the split usage and cost to be charged"
+          Name: "detail_ec2_list"
+          QueryString: !Sub |
+                        SELECT ec2_resource_id,
+                          line_item_usage_account_id,
+                          cost_allocation_tag,
+                          product_instance_type,
+                          product_region,
+                          hours_on,
+                          split_ratio,
+                          split_cost
+                        FROM "dedicated_host_db"."dh_joined_split_ratios_view"
+                        where month = ?
+                          and year = ?
+
+  tagBaseSplit:
+        Type: AWS::Athena::NamedQuery
+        Properties:
+          WorkGroup: !Ref dedicatedHostChargeback
+          Database: !Ref curDatabase
+          Description: "Sample Query returning the Split consumption of EC2 on top of DH grouped by Cost Allocation Tag for a specific month/year"
+          Name: "tag_base_split"
+          QueryString: !Sub |
+                        SELECT case
+                            when cost_allocation_tag = '' then 'Untagged' else cost_allocation_tag
+                          end as cost_allocation_tag,
+                          sum(split_ratio) as split_ratio,
+                          sum(split_cost) as split_cost
+                        FROM "dedicated_host_db"."dh_joined_split_ratios_view"
+                        where month = ?
+                          and year = ?
+                        group by cost_allocation_tag
+                        order by 1
+
